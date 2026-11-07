@@ -157,7 +157,7 @@ pub(super) trait LmdbLifecycle: Sync {
         }
     }
 
-    fn shutdown(&self) -> impl SendFut<Result<(), StoreError>> {
+        fn shutdown(&self) -> impl SendFut<Result<(), StoreError>> {
         async move {
             self.status_atomic().store(StatusType::Closing);
             self.cancel_token().cancel();
@@ -186,10 +186,27 @@ pub(super) trait LmdbLifecycle: Sync {
                 }
             }
 
-            let _ = self.clean_trailing().await;
-            if let Err(e) = self.env().sync(true) {
-                warn!(%e, "LMDB fsync before close failed");
+            // Bound the remaining cleanup so a large LMDB sync cannot stall exit.
+            let cleanup = async {
+                let _ = self.clean_trailing().await;
+                // Non-blocking sync; LMDB is crash-safe if this is skipped.
+                if let Err(e) = self.env().sync(false) {
+                    warn!(%e, "LMDB async sync before close failed");
+                }
+                Ok::<(), StoreError>(())
+            };
+
+            tokio::select! {
+                res = cleanup => {
+                    if let Err(e) = res {
+                        warn!(%e, "cleanup failed during shutdown");
+                    }
+                }
+                _ = sleep(Duration::from_secs(10)) => {
+                    warn!("cleanup timed out – forcing exit");
+                }
             }
+
             Ok(())
         }
     }
